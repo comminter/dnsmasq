@@ -352,6 +352,11 @@
 # Set the NTP time server addresses to 192.168.0.4 and 10.10.0.5
 #dhcp-option=option:ntp-server,192.168.0.4,10.10.0.5
 
+# Text options can include %MAC and %TIMESTAMP. These are replaced in each
+# DHCPv4 reply with the hyphen-separated client MAC address and the
+# lease-allocation time.
+#dhcp-option=224,client=%MAC,time=%TIMESTAMP
+
 # Send DHCPv6 option. Note [] around IPv6 addresses.
 #dhcp-option=option6:dns-server,[1234::77],[1234::88]
 

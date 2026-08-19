@@ -61,7 +61,7 @@ static void do_options(struct dhcp_context *context,
 
 
 static void match_vendor_opts(unsigned char *opt, struct dhcp_opt *dopt); 
-static int do_encap_opts(struct dhcp_opt *opt, int encap, int flag, struct dhcp_packet *mess, unsigned char *end, int null_term);
+static int do_encap_opts(struct dhcp_opt *opt, int encap, int flag, struct dhcp_packet *mess, unsigned char *end, int null_term, time_t now);
 static void pxe_misc(struct dhcp_packet *mess, unsigned char *end, unsigned char *uuid, const char *pxevendor);
 static int prune_vendor_opts(struct dhcp_netid *netid);
 static struct dhcp_opt *pxe_opts(int pxe_arch, struct dhcp_netid *netid, struct in_addr local, time_t now);
@@ -69,8 +69,9 @@ struct dhcp_boot *find_boot(struct dhcp_netid *netid);
 static int pxe_uefi_workaround(int pxe_arch, struct dhcp_netid *netid, struct dhcp_packet *mess, struct in_addr local, time_t now, int pxe);
 static void apply_delay(u32 xid, time_t recvtime, struct dhcp_netid *netid);
 static int is_pxe_client(struct dhcp_packet *mess, size_t sz, const char **pxe_vendor);
-static int do_opt(struct dhcp_opt *opt, unsigned char *p, struct dhcp_context *context, int null_term);
-static void handle_encap(struct dhcp_packet *mess, unsigned char *end, unsigned char *req_options, int null_term, struct dhcp_netid *tagif, int pxemode);
+static int do_opt(struct dhcp_opt *opt, unsigned char *p, struct dhcp_context *context, int null_term,
+		  unsigned char *hwaddr, int hwlen, time_t now);
+static void handle_encap(struct dhcp_packet *mess, unsigned char *end, unsigned char *req_options, int null_term, struct dhcp_netid *tagif, int pxemode, time_t now);
 
 size_t dhcp_reply(struct dhcp_context *context, char *iface_name, int int_index,
 		  size_t sz, time_t now, int unicast_dest, int loopback,
@@ -948,7 +949,7 @@ size_t dhcp_reply(struct dhcp_context *context, char *iface_name, int int_index,
 	  opt71.flags = DHOPT_VENDOR_MATCH;
 	  opt71.netid = NULL;
 	  opt71.next = daemon->dhcp_opts;
-	  do_encap_opts(&opt71, OPTION_VENDOR_CLASS_OPT, DHOPT_VENDOR_MATCH, mess, end, 0);
+	  do_encap_opts(&opt71, OPTION_VENDOR_CLASS_OPT, DHOPT_VENDOR_MATCH, mess, end, 0, now);
 	  
 	  daemon->metrics[METRIC_PXE]++;
 	  log_packet("PXE", &mess->yiaddr, emac, emac_len, iface_name, (char *)mess->file, NULL, mess->xid);
@@ -1020,7 +1021,7 @@ size_t dhcp_reply(struct dhcp_context *context, char *iface_name, int int_index,
 		  pxe_misc(mess, end, uuid, pxevendor);
 		  prune_vendor_opts(tagif_netid);
 		  if ((pxe && !workaround) || !redirect4011)
-		    do_encap_opts(pxe_opts(pxearch, tagif_netid, tmp->local, now), OPTION_VENDOR_CLASS_OPT, DHOPT_VENDOR_MATCH, mess, end, 0);
+		    do_encap_opts(pxe_opts(pxearch, tagif_netid, tmp->local, now), OPTION_VENDOR_CLASS_OPT, DHOPT_VENDOR_MATCH, mess, end, 0, now);
 
 		  /* dhcp-option-pxe ONLY */
 		  for (option = daemon->dhcp_opts; option; option = option->next)
@@ -1031,13 +1032,13 @@ size_t dhcp_reply(struct dhcp_context *context, char *iface_name, int int_index,
 		      if (!(option->flags & DHOPT_TAGOK))
 			continue;
 		      
-		      len = do_opt(option, NULL, tmp, borken_opt);
+		      len = do_opt(option, NULL, tmp, borken_opt, mess->chaddr, mess->hlen, now);
 
 		      if ((p = free_space(mess, end, option->opt, len)))
-			do_opt(option, p, tmp, borken_opt);
+			do_opt(option, p, tmp, borken_opt, mess->chaddr, mess->hlen, now);
 		    }
 
-		  handle_encap(mess, end, req_options, borken_opt, tagif_netid, 2);
+		  handle_encap(mess, end, req_options, borken_opt, tagif_netid, 2, now);
 		  
 		  daemon->metrics[METRIC_PXE]++;
 		  log_packet("PXE", NULL, emac, emac_len, iface_name, ignore ? "proxy-ignored" : "proxy", NULL, mess->xid);
@@ -2129,6 +2130,12 @@ static size_t dhcp_packet_size(struct dhcp_packet *mess, unsigned char *agent_id
 static unsigned char *free_space(struct dhcp_packet *mess, unsigned char *end, int opt, int len)
 {
   unsigned char *p = dhcp_skip_opts(&mess->options[0] + sizeof(u32));
+
+  if (len > 255)
+    {
+      my_syslog(MS_DHCP | LOG_WARNING, _("cannot send DHCP/BOOTP option %d: option too long"), opt);
+      return NULL;
+    }
   
   if (p + len + 3 >= end)
     /* not enough space in options area, try and use overload, if poss */
@@ -2212,9 +2219,77 @@ static void option_put_string(struct dhcp_packet *mess, unsigned char *end, int 
 }
 
 /* return length, note this only does the data part */
-static int do_opt(struct dhcp_opt *opt, unsigned char *p, struct dhcp_context *context, int null_term)
+static int do_opt(struct dhcp_opt *opt, unsigned char *p, struct dhcp_context *context, int null_term,
+		  unsigned char *hwaddr, int hwlen, time_t now)
 {
   int len = opt->len;
+  char timestamp[32];
+  const unsigned char *in;
+  int left;
+
+  /* String-valued options may contain values which are only known when the
+     reply is made. Do both the sizing and copying here since callers invoke
+     us once for each operation. */
+  if ((opt->flags & DHOPT_STRING) && opt->val &&
+      (strstr((char *)opt->val, "%MAC") || strstr((char *)opt->val, "%TIMESTAMP")))
+    {
+      int outlen = 0;
+
+      snprintf(timestamp, sizeof(timestamp), "%lu", (unsigned long)now);
+      for (in = opt->val, left = opt->len; left; )
+	{
+	  const char *replacement = NULL;
+	  int replacement_len = 0;
+
+	  if (left >= 4 && memcmp(in, "%MAC", 4) == 0)
+	    {
+	      replacement_len = hwlen ? hwlen * 3 - 1 : 0;
+	      if (p)
+		{
+		  static const char hex[] = "0123456789abcdef";
+		  int i;
+		  for (i = 0; i < hwlen; i++)
+		    {
+		      if (i)
+			*p++ = '-';
+		      *p++ = hex[hwaddr[i] >> 4];
+		      *p++ = hex[hwaddr[i] & 0xf];
+		    }
+		}
+	      in += 4;
+	      left -= 4;
+	    }
+	  else if (left >= 10 && memcmp(in, "%TIMESTAMP", 10) == 0)
+	    {
+	      replacement = timestamp;
+	      replacement_len = strlen(timestamp);
+	      in += 10;
+	      left -= 10;
+	    }
+	  else
+	    {
+	      replacement = (char *)in++;
+	      replacement_len = 1;
+	      left--;
+	    }
+
+	  if (p && replacement)
+	    {
+	      memcpy(p, replacement, replacement_len);
+	      p += replacement_len;
+	    }
+	  outlen += replacement_len;
+	}
+
+	if (null_term && outlen != 255)
+	  {
+	    if (p)
+	      *p = 0;
+	    outlen++;
+	  }
+
+	return outlen;
+    }
   
   if ((opt->flags & DHOPT_STRING) && null_term && len != 255)
     len++;
@@ -2308,7 +2383,7 @@ static void match_vendor_opts(unsigned char *opt, struct dhcp_opt *dopt)
 }
 
 static int do_encap_opts(struct dhcp_opt *opt, int encap, int flag,  
-			 struct dhcp_packet *mess, unsigned char *end, int null_term)
+			 struct dhcp_packet *mess, unsigned char *end, int null_term, time_t now)
 {
   int len, enc_len, ret = 0;
   struct dhcp_opt *start;
@@ -2318,7 +2393,7 @@ static int do_encap_opts(struct dhcp_opt *opt, int encap, int flag,
   for (enc_len = 0, start = opt; opt; opt = opt->next)
     if (opt->flags & flag)
       {
-	int new = do_opt(opt, NULL, NULL, null_term) + 2;
+	int new = do_opt(opt, NULL, NULL, null_term, mess->chaddr, mess->hlen, now) + 2;
 	ret  = 1;
 	if (enc_len + new <= 255)
 	  enc_len += new;
@@ -2328,7 +2403,7 @@ static int do_encap_opts(struct dhcp_opt *opt, int encap, int flag,
 	    for (; start && start != opt; start = start->next)
 	      if (p && (start->flags & flag))
 		{
-		  len = do_opt(start, p + 2, NULL, null_term);
+		  len = do_opt(start, p + 2, NULL, null_term, mess->chaddr, mess->hlen, now);
 		  *(p++) = start->opt;
 		  *(p++) = len;
 		  p += len;
@@ -2344,7 +2419,7 @@ static int do_encap_opts(struct dhcp_opt *opt, int encap, int flag,
       for (; start; start = start->next)
 	if (start->flags & flag)
 	  {
-	    len = do_opt(start, p + 2, NULL, null_term);
+	    len = do_opt(start, p + 2, NULL, null_term, mess->chaddr, mess->hlen, now);
 	    *(p++) = start->opt;
 	    *(p++) = len;
 	    p += len;
@@ -2912,12 +2987,14 @@ static void do_options(struct dhcp_context *context,
       
       /* always force null-term for filename and servername - buggy PXE again. */
       len = do_opt(opt, NULL, context, 
-		   (optno == OPTION_SNAME || optno == OPTION_FILENAME) ? 1 : null_term);
+		   (optno == OPTION_SNAME || optno == OPTION_FILENAME) ? 1 : null_term,
+		   mess->chaddr, mess->hlen, now);
 
       if ((p = free_space(mess, end, optno, len)))
 	{
 	  do_opt(opt, p, context, 
-		 (optno == OPTION_SNAME || optno == OPTION_FILENAME) ? 1 : null_term);
+		 (optno == OPTION_SNAME || optno == OPTION_FILENAME) ? 1 : null_term,
+		 mess->chaddr, mess->hlen, now);
 	  
 	  /* If we send a vendor-id, revisit which vendor-ops we consider 
 	     it appropriate to send. */
@@ -2930,7 +3007,7 @@ static void do_options(struct dhcp_context *context,
     }
 
   /* encapsulated options. */
-  handle_encap(mess, end, req_options, null_term, tagif, pxe_arch != 1);
+  handle_encap(mess, end, req_options, null_term, tagif, pxe_arch != 1, now);
   
   force_encap = prune_vendor_opts(tagif);
     
@@ -2942,7 +3019,7 @@ static void do_options(struct dhcp_context *context,
     }
 
   if ((force_encap || in_list(req_options, OPTION_VENDOR_CLASS_OPT) || in_list(req_options, OPTION_VENDOR_ID)) &&
-      (leasequery || do_encap_opts(config_opts, OPTION_VENDOR_CLASS_OPT, DHOPT_VENDOR_MATCH, mess, end, null_term)) && 
+      (leasequery || do_encap_opts(config_opts, OPTION_VENDOR_CLASS_OPT, DHOPT_VENDOR_MATCH, mess, end, null_term, now)) &&
       pxe_arch == -1 && !done_vendor_class && vendor_class_len != 0 &&
       (p = free_space(mess, end, OPTION_VENDOR_ID, vendor_class_len)))
     /* If we send vendor encapsulated options, and haven't already sent option 60,
@@ -2958,7 +3035,7 @@ static void do_options(struct dhcp_context *context,
 }
 
 static void handle_encap(struct dhcp_packet *mess, unsigned char *end, unsigned char *req_options,
-			 int null_term, struct dhcp_netid *tagif, int pxemode)
+			 int null_term, struct dhcp_netid *tagif, int pxemode, time_t now)
 {
   /* Send options to be encapsulated in arbitrary options, 
      eg dhcp-option=encap:172,17,.......
@@ -3002,14 +3079,14 @@ static void handle_encap(struct dhcp_packet *mess, unsigned char *end, unsigned 
 		{
 		  o->flags |= DHOPT_ENCAP_MATCH;
 		  found = 1;
-		  len += do_opt(o, NULL, NULL, 0) + 2;
+		  len += do_opt(o, NULL, NULL, 0, mess->chaddr, mess->hlen, now) + 2;
 		}
 	    } 
 	  
 	  if (found)
 	    { 
 	      if (flags & DHOPT_ENCAPSULATE)
-		do_encap_opts(config_opts, opt->u.encap, DHOPT_ENCAP_MATCH, mess, end, null_term);
+		do_encap_opts(config_opts, opt->u.encap, DHOPT_ENCAP_MATCH, mess, end, null_term, now);
 	      else if (len > 250)
 		my_syslog(MS_DHCP | LOG_WARNING, _("cannot send RFC3925 option: too many options for enterprise number %d"), opt->u.encap);
 	      else if ((p = free_space(mess, end,  OPTION_VENDOR_IDENT_OPT, len + 5)))
@@ -3021,7 +3098,7 @@ static void handle_encap(struct dhcp_packet *mess, unsigned char *end, unsigned 
 		  for (o = config_opts; o; o = o->next)
 		    if (o->flags & DHOPT_ENCAP_MATCH)
 		      {
-			len = do_opt(o, p + 2, NULL, 0);
+			len = do_opt(o, p + 2, NULL, 0, mess->chaddr, mess->hlen, now);
 			*(p++) = o->opt;
 			*(p++) = len;
 			p += len;
