@@ -1359,6 +1359,11 @@ Data types allowed are comma separated
 dotted-quad IPv4 addresses, []-wrapped IPv6 addresses, a decimal number, colon-separated hex digits
 and a text string. If the optional tags are given then
 this option is only sent when all the tags are matched.
+In text values for DHCPv4 options, \fB%MAC\fP is replaced when each reply is
+created by the client's hyphen-separated hardware address, and
+\fB%TIMESTAMP\fP is replaced by the number of seconds since the Unix epoch at
+the time the lease is allocated. For example,
+\fB--dhcp-option=224,"client=%MAC,time=%TIMESTAMP"\fP.
 
 Special processing is done on a text argument for option 119, to
 conform with RFC 3397. Text or dotted-quad IP addresses as arguments
