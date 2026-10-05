@@ -81,6 +81,10 @@ int add_to_nftset(const char *setname, const union all_addr *ipaddr, int flags, 
   ret = nft_run_cmd_from_buffer(ctx, cmd_buf);
   err = nft_ctx_get_error_buffer(ctx);
 
+  /* Adding an address from a cached reply is deliberately idempotent. */
+  if (ret != 0 && err && strstr(err, "File exists"))
+    ret = 0;
+
   if (ret != 0)
     {
       /* Log only first line of error return. */

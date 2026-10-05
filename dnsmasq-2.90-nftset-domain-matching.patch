@@ -1,0 +1,173 @@
+diff --git a/src/dnsmasq.h b/src/dnsmasq.h
+index e455c3f..61eb58a 100644
+--- a/src/dnsmasq.h
++++ b/src/dnsmasq.h
+@@ -1382,6 +1382,9 @@ char *get_domain6(struct in6_addr *addr);
+ int is_name_synthetic(int flags, char *name, union all_addr *addr);
+ int is_rev_synth(int flag, union all_addr *addr, char *name);
+ 
++struct ipsets *domain_find_sets(struct ipsets *setlist, const char *domain,
++				int nftset, unsigned int query_flags);
++
+ /* rfc1035.c */
+ int do_doctor(struct dns_header *header, size_t qlen, char *namebuff);
+ int extract_name(struct dns_header *header, size_t plen, unsigned char **pp, 
+diff --git a/src/forward.c b/src/forward.c
+index 10e7496..1e02443 100644
+--- a/src/forward.c
++++ b/src/forward.c
+@@ -661,18 +661,59 @@ int fast_retry(time_t now)
+   return ret;
+ }
+ 
+-static struct ipsets *domain_find_sets(struct ipsets *setlist, const char *domain) {
++static int set_matches_query_type(struct ipsets *entry, unsigned int query_flags)
++{
++  char **set;
++
++  if (!entry)
++    return 0;
++
++  if (!(query_flags & (F_IPV4 | F_IPV6)))
++    return 1;
++
++  for (set = entry->sets; *set; set++)
++    if (!((*set)[1] == ' ' && ((*set)[0] == '4' || (*set)[0] == '6')) ||
++	((*set)[0] == '4' && (query_flags & F_IPV4)) ||
++	((*set)[0] == '6' && (query_flags & F_IPV6)))
++      return 1;
++
++  return 0;
++}
++
++struct ipsets *domain_find_sets(struct ipsets *setlist, const char *domain,
++			       int nftset, unsigned int query_flags) {
+   /* Similar algorithm to search_servers. */
+   struct ipsets *ipset_pos, *ret = NULL;
+   unsigned int namelen = strlen(domain);
+   unsigned int matchlen = 0;
+   for (ipset_pos = setlist; ipset_pos; ipset_pos = ipset_pos->next) 
+     {
+-      unsigned int domainlen = strlen(ipset_pos->domain);
+-      const char *matchstart = domain + namelen - domainlen;
+-      if (namelen >= domainlen && hostname_isequal(matchstart, ipset_pos->domain) &&
+-          (domainlen == 0 || namelen == domainlen || *(matchstart - 1) == '.' ) &&
+-          domainlen >= matchlen) 
++      const char *setdomain = ipset_pos->domain;
++      int subdomain_only = nftset && setdomain[0] == '*' && setdomain[1] == '.';
++      unsigned int domainlen;
++      const char *matchstart;
++      int exact, subdomain, suffix_match, mode_match;
++
++      if (subdomain_only)
++	setdomain += 2;
++      domainlen = strlen(setdomain);
++
++      if (nftset && !set_matches_query_type(ipset_pos, query_flags))
++	continue;
++
++      if (namelen < domainlen)
++	continue;
++
++      matchstart = domain + namelen - domainlen;
++      exact = namelen == domainlen;
++      subdomain = namelen > domainlen && *(matchstart - 1) == '.';
++      suffix_match = hostname_isequal(matchstart, setdomain);
++      mode_match = (!nftset && (exact || subdomain)) ||
++	(nftset && exact && !subdomain_only) ||
++	(nftset && subdomain && subdomain_only);
++
++      if (suffix_match && (domainlen == 0 || mode_match) &&
++	  domainlen >= matchlen)
+         {
+           matchlen = domainlen;
+           ret = ipset_pos;
+@@ -695,14 +736,22 @@ static size_t process_reply(struct dns_header *header, time_t now, struct server
+   (void)ad_reqd;
+   (void)do_bit;
+  
+-#ifdef HAVE_IPSET
+-  if (daemon->ipsets && extract_request(header, n, daemon->namebuff, NULL))
+-    ipsets = domain_find_sets(daemon->ipsets, daemon->namebuff);
+-#endif
++#if defined(HAVE_IPSET) || defined(HAVE_NFTSET)
++  if (daemon->ipsets || daemon->nftsets)
++    {
++      unsigned int query_flags = extract_request(header, n, daemon->namebuff, NULL);
++
++      if (query_flags)
++        {
++#  ifdef HAVE_IPSET
++          ipsets = domain_find_sets(daemon->ipsets, daemon->namebuff, 0, query_flags);
++#  endif
+ 
+-#ifdef HAVE_NFTSET
+-  if (daemon->nftsets && extract_request(header, n, daemon->namebuff, NULL))
+-    nftsets = domain_find_sets(daemon->nftsets, daemon->namebuff);
++#  ifdef HAVE_NFTSET
++          nftsets = domain_find_sets(daemon->nftsets, daemon->namebuff, 1, query_flags);
++#  endif
++        }
++    }
+ #endif
+ 
+   if ((pheader = find_pseudoheader(header, n, &plen, &sizep, &is_sign, NULL)))
+diff --git a/src/nftset.c b/src/nftset.c
+index 123326c..f2bed99 100644
+--- a/src/nftset.c
++++ b/src/nftset.c
+@@ -81,6 +81,10 @@ int add_to_nftset(const char *setname, const union all_addr *ipaddr, int flags,
+   ret = nft_run_cmd_from_buffer(ctx, cmd_buf);
+   err = nft_ctx_get_error_buffer(ctx);
+ 
++  /* Adding an address from a cached reply is deliberately idempotent. */
++  if (ret != 0 && err && strstr(err, "File exists"))
++    ret = 0;
++
+   if (ret != 0)
+     {
+       /* Log only first line of error return. */
+diff --git a/src/rfc1035.c b/src/rfc1035.c
+index 387d894..734f698 100644
+--- a/src/rfc1035.c
++++ b/src/rfc1035.c
+@@ -665,6 +665,12 @@ int extract_addresses(struct dns_header *header, size_t qlen, char *name, time_t
+   
+   GETSHORT(qtype, p); 
+   GETSHORT(qclass, p);
++
++#ifdef HAVE_NFTSET
++  if (daemon->nftsets && qclass == C_IN && (qtype == T_A || qtype == T_AAAA))
++    cached_nftsets = domain_find_sets(daemon->nftsets, name, 1,
++				      qtype == T_A ? F_IPV4 : F_IPV6);
++#endif
+   
+   if (qclass != C_IN)
+     return 0;
+@@ -1581,6 +1587,9 @@ size_t answer_request(struct dns_header *header, char *limit, size_t qlen,
+   size_t len;
+   int rd_bit = (header->hb3 & HB3_RD);
+   int count = 255; /* catch loops */
++#ifdef HAVE_NFTSET
++  struct ipsets *cached_nftsets = NULL;
++#endif
+   
+   if (stale)
+     *stale = 0;
+@@ -2031,6 +2040,16 @@ size_t answer_request(struct dns_header *header, char *limit, size_t qlen,
+ 			ans = 1;
+ 			log_query(stale_flag | (crecp->flags & ~F_REVERSE), name, &crecp->addr,
+ 				  record_source(crecp->uid), 0);
++
++#ifdef HAVE_NFTSET
++			if (cached_nftsets)
++			  {
++			    char **nftsets_cur;
++
++			    for (nftsets_cur = cached_nftsets->sets; *nftsets_cur; nftsets_cur++)
++			      add_to_nftset(*nftsets_cur, &crecp->addr, flag, 0);
++			  }
++#endif
+ 			
+ 			if (add_resource_record(header, limit, &trunc, nameoffset, &ansp, 
+ 						crec_ttl(crecp, now), NULL, type, C_IN, 
