@@ -671,17 +671,35 @@ int fast_retry(time_t now)
 }
 
 #if defined(HAVE_IPSET) || defined(HAVE_NFTSET)
-static struct ipsets *domain_find_sets(struct ipsets *setlist, const char *domain) {
+static struct ipsets *domain_find_sets(struct ipsets *setlist, const char *domain, int nftset) {
   /* Similar algorithm to search_servers. */
   struct ipsets *ipset_pos, *ret = NULL;
   unsigned int namelen = strlen(domain);
   unsigned int matchlen = 0;
   for (ipset_pos = setlist; ipset_pos; ipset_pos = ipset_pos->next) 
     {
-      unsigned int domainlen = strlen(ipset_pos->domain);
-      const char *matchstart = domain + namelen - domainlen;
-      if (namelen >= domainlen && hostname_isequal(matchstart, ipset_pos->domain) &&
-          (domainlen == 0 || namelen == domainlen || *(matchstart - 1) == '.' ) &&
+      const char *setdomain = ipset_pos->domain;
+      int subdomain_only = nftset && setdomain[0] == '*' && setdomain[1] == '.';
+      unsigned int domainlen;
+      const char *matchstart;
+      int exact, subdomain, suffix_match, mode_match;
+
+      if (subdomain_only)
+	setdomain += 2;
+      domainlen = strlen(setdomain);
+
+      if (namelen < domainlen)
+	continue;
+
+      matchstart = domain + namelen - domainlen;
+      exact = namelen == domainlen;
+      subdomain = namelen > domainlen && *(matchstart - 1) == '.';
+      suffix_match = hostname_isequal(matchstart, setdomain);
+      mode_match = (!nftset && (exact || subdomain)) ||
+	(nftset && exact && !subdomain_only) ||
+	(nftset && subdomain && subdomain_only);
+
+      if (suffix_match && (domainlen == 0 || mode_match) &&
           domainlen >= matchlen) 
         {
           matchlen = domainlen;
@@ -710,11 +728,11 @@ static size_t process_reply(struct dns_header *header, time_t now, struct server
   if ((daemon->ipsets || daemon->nftsets) && extract_name(header, n, NULL, daemon->namebuff, EXTR_NAME_EXTRACT, 0))
     {
 #  ifdef HAVE_IPSET
-      ipsets = domain_find_sets(daemon->ipsets, daemon->namebuff);
+      ipsets = domain_find_sets(daemon->ipsets, daemon->namebuff, 0);
 #  endif
       
 #  ifdef HAVE_NFTSET
-      nftsets = domain_find_sets(daemon->nftsets, daemon->namebuff);
+      nftsets = domain_find_sets(daemon->nftsets, daemon->namebuff, 1);
 #  endif
     }
 #endif
