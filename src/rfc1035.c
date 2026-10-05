@@ -687,6 +687,44 @@ static int log_txt(char *name, unsigned char *p, const int ardlen, int flag)
    Return 1 if we reject an address because it look like part of dns-rebinding attack. 
    Return 2 if the packet is malformed.
 */
+#ifdef HAVE_NFTSET
+static struct ipsets *nftsets_for_name(const char *name, int addrflags)
+{
+  struct ipsets *entry, *ret = NULL;
+  unsigned int namelen = strlen(name), matchlen = 0;
+
+  for (entry = daemon->nftsets; entry; entry = entry->next)
+    {
+      const char *domain = entry->domain;
+      int subdomains = domain[0] == '*' && domain[1] == '.';
+      unsigned int domainlen;
+      char **set;
+      int family_match = 0;
+
+      if (subdomains)
+	domain += 2;
+
+      for (set = entry->sets; *set; set++)
+	if (!((*set)[1] == ' ' && ((*set)[0] == '4' || (*set)[0] == '6')) ||
+	    ((*set)[0] == '4' && (addrflags & F_IPV4)) ||
+	    ((*set)[0] == '6' && (addrflags & F_IPV6)))
+	  family_match = 1;
+
+      domainlen = strlen(domain);
+      if (family_match && namelen >= domainlen && domainlen >= matchlen &&
+	  hostname_isequal(name + namelen - domainlen, domain) &&
+	  ((!subdomains && namelen == domainlen) ||
+	   (subdomains && namelen > domainlen && name[namelen - domainlen - 1] == '.')))
+	{
+	  matchlen = domainlen;
+	  ret = entry;
+	}
+    }
+
+  return ret;
+}
+#endif
+
 int extract_addresses(struct dns_header *header, size_t qlen, char *name, time_t now, 
 		      struct ipsets *ipsets, struct ipsets *nftsets, int check_rebind,
 		      int no_cache_dnssec, int secure)
@@ -1018,6 +1056,7 @@ int extract_addresses(struct dns_header *header, size_t qlen, char *name, time_t
 			}
 #endif
 #ifdef HAVE_NFTSET
+		      nftsets = nftsets_for_name(name, flags);
 		      if (nftsets)
 			{
 			  if (daemon->pipe_to_parent != -1)
@@ -2080,6 +2119,23 @@ size_t answer_request(struct dns_header *header, char *limit, size_t qlen,
 			ans = 1;
 			log_query(stale_flag | (crecp->flags & ~F_REVERSE), name, &crecp->addr,
 				  record_source(crecp->uid), 0);
+
+#ifdef HAVE_NFTSET
+			{
+			  struct ipsets *nftsets = nftsets_for_name(name, flag);
+
+			  if (nftsets)
+			    {
+			      char **set;
+
+			      if (daemon->pipe_to_parent != -1)
+				cache_send_ipset(PIPE_OP_NFTSET, nftsets, flag, &crecp->addr);
+			      else
+				for (set = nftsets->sets; *set; set++)
+				  add_to_nftset(*set, &crecp->addr, flag, 0);
+			    }
+			}
+#endif
 			
 			if (add_resource_record(header, limit, &trunc, nameoffset, &ansp, 
 						crec_ttl(crecp, now), NULL, type, C_IN, 
