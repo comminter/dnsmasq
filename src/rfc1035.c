@@ -1628,6 +1628,9 @@ size_t answer_request(struct dns_header *header, char *limit, size_t qlen,
   size_t len;
   int rd_bit = (header->hb3 & HB3_RD);
   int count = 255; /* catch loops */
+#ifdef HAVE_NFTSET
+  struct ipsets *cached_nftsets = NULL;
+#endif
 
   /* Suppress cached answers if no_cache set. */
   if (no_cache)
@@ -1668,6 +1671,12 @@ size_t answer_request(struct dns_header *header, char *limit, size_t qlen,
   
   GETSHORT(qtype, p); 
   GETSHORT(qclass, p);
+
+#ifdef HAVE_NFTSET
+  if (daemon->nftsets && qclass == C_IN && (qtype == T_A || qtype == T_AAAA))
+    cached_nftsets = domain_find_sets(daemon->nftsets, name, 1,
+				      qtype == T_A ? F_IPV4 : F_IPV6);
+#endif
   
   ans = 0; /* have we answered this question */
   
@@ -2080,6 +2089,19 @@ size_t answer_request(struct dns_header *header, char *limit, size_t qlen,
 			ans = 1;
 			log_query(stale_flag | (crecp->flags & ~F_REVERSE), name, &crecp->addr,
 				  record_source(crecp->uid), 0);
+
+#ifdef HAVE_NFTSET
+			if (cached_nftsets)
+			  {
+			    char **nftsets_cur;
+
+			    if (daemon->pipe_to_parent != -1)
+			      cache_send_ipset(PIPE_OP_NFTSET, cached_nftsets, flag, &crecp->addr);
+			    else
+			      for (nftsets_cur = cached_nftsets->sets; *nftsets_cur; nftsets_cur++)
+				add_to_nftset(*nftsets_cur, &crecp->addr, flag, 0);
+			  }
+#endif
 			
 			if (add_resource_record(header, limit, &trunc, nameoffset, &ansp, 
 						crec_ttl(crecp, now), NULL, type, C_IN, 

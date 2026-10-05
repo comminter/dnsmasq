@@ -1388,6 +1388,8 @@ void cache_update_hwm(void);
 #if defined(HAVE_IPSET) || defined(HAVE_NFTSET)
 void cache_send_ipset(unsigned char op, struct ipsets *sets,
 		      int flags, union all_addr *addr);
+struct ipsets *domain_find_sets(struct ipsets *setlist, const char *domain,
+				int nftset, unsigned int query_flags);
 #endif
 struct crec *cache_insert(char *name, union all_addr *addr, unsigned short class, 
 			  time_t now, unsigned long ttl, unsigned int flags);

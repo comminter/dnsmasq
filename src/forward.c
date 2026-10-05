@@ -671,18 +671,59 @@ int fast_retry(time_t now)
 }
 
 #if defined(HAVE_IPSET) || defined(HAVE_NFTSET)
-static struct ipsets *domain_find_sets(struct ipsets *setlist, const char *domain) {
+static int set_matches_query_type(struct ipsets *entry, unsigned int query_flags)
+{
+  char **set;
+
+  if (!entry)
+    return 0;
+
+  if (!(query_flags & (F_IPV4 | F_IPV6)))
+    return 1;
+
+  for (set = entry->sets; *set; set++)
+    if (!((*set)[1] == ' ' && ((*set)[0] == '4' || (*set)[0] == '6')) ||
+	((*set)[0] == '4' && (query_flags & F_IPV4)) ||
+	((*set)[0] == '6' && (query_flags & F_IPV6)))
+      return 1;
+
+  return 0;
+}
+
+struct ipsets *domain_find_sets(struct ipsets *setlist, const char *domain,
+			int nftset, unsigned int query_flags) {
   /* Similar algorithm to search_servers. */
   struct ipsets *ipset_pos, *ret = NULL;
   unsigned int namelen = strlen(domain);
   unsigned int matchlen = 0;
   for (ipset_pos = setlist; ipset_pos; ipset_pos = ipset_pos->next) 
     {
-      unsigned int domainlen = strlen(ipset_pos->domain);
-      const char *matchstart = domain + namelen - domainlen;
-      if (namelen >= domainlen && hostname_isequal(matchstart, ipset_pos->domain) &&
-          (domainlen == 0 || namelen == domainlen || *(matchstart - 1) == '.' ) &&
-          domainlen >= matchlen) 
+      const char *setdomain = ipset_pos->domain;
+      int subdomain_only = nftset && setdomain[0] == '*' && setdomain[1] == '.';
+      unsigned int domainlen;
+      const char *matchstart;
+      int exact, subdomain, suffix_match, mode_match;
+
+      if (subdomain_only)
+	setdomain += 2;
+      domainlen = strlen(setdomain);
+
+      if (nftset && !set_matches_query_type(ipset_pos, query_flags))
+	continue;
+
+      if (namelen < domainlen)
+	continue;
+
+      matchstart = domain + namelen - domainlen;
+      exact = namelen == domainlen;
+      subdomain = namelen > domainlen && *(matchstart - 1) == '.';
+      suffix_match = hostname_isequal(matchstart, setdomain);
+      mode_match = (!nftset && (exact || subdomain)) ||
+	(nftset && exact && !subdomain_only) ||
+	(nftset && subdomain && subdomain_only);
+
+      if (suffix_match && (domainlen == 0 || mode_match) &&
+	  domainlen >= matchlen)
         {
           matchlen = domainlen;
           ret = ipset_pos;
@@ -707,15 +748,20 @@ static size_t process_reply(struct dns_header *header, time_t now, struct server
   (void)do_bit;
  
 #if defined(HAVE_IPSET) || defined(HAVE_NFTSET)
-  if ((daemon->ipsets || daemon->nftsets) && extract_name(header, n, NULL, daemon->namebuff, EXTR_NAME_EXTRACT, 0))
+  if (daemon->ipsets || daemon->nftsets)
     {
+      unsigned int query_flags = extract_request(header, n, daemon->namebuff, NULL, NULL);
+
+      if (query_flags)
+	{
 #  ifdef HAVE_IPSET
-      ipsets = domain_find_sets(daemon->ipsets, daemon->namebuff);
+	  ipsets = domain_find_sets(daemon->ipsets, daemon->namebuff, 0, query_flags);
 #  endif
       
 #  ifdef HAVE_NFTSET
-      nftsets = domain_find_sets(daemon->nftsets, daemon->namebuff);
+	  nftsets = domain_find_sets(daemon->nftsets, daemon->namebuff, 1, query_flags);
 #  endif
+	}
     }
 #endif
   
