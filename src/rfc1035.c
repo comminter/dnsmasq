@@ -687,6 +687,60 @@ static int log_txt(char *name, unsigned char *p, const int ardlen, int flag)
    Return 1 if we reject an address because it look like part of dns-rebinding attack. 
    Return 2 if the packet is malformed.
 */
+#ifdef HAVE_NFTSET
+static struct ipsets *nftsets_for_name(const char *name, int addrflags)
+{
+  struct ipsets *entry, *ret = NULL;
+  unsigned int namelen = strlen(name), matchlen = 0;
+
+  for (entry = daemon->nftsets; entry; entry = entry->next)
+    {
+      const char *domain = entry->domain;
+      int subdomains = domain[0] == '*' && domain[1] == '.';
+      unsigned int domainlen;
+      char **set;
+      int family_match = 0;
+
+      if (subdomains)
+	domain += 2;
+
+      for (set = entry->sets; *set; set++)
+	if (!((*set)[1] == ' ' && ((*set)[0] == '4' || (*set)[0] == '6')) ||
+	    ((*set)[0] == '4' && (addrflags & F_IPV4)) ||
+	    ((*set)[0] == '6' && (addrflags & F_IPV6)))
+	  family_match = 1;
+
+      domainlen = strlen(domain);
+      if (family_match && namelen >= domainlen && domainlen >= matchlen &&
+	  hostname_isequal(name + namelen - domainlen, domain) &&
+	  ((!subdomains && namelen == domainlen) ||
+	   (subdomains && namelen > domainlen && name[namelen - domainlen - 1] == '.')))
+	{
+	  matchlen = domainlen;
+	  ret = entry;
+	}
+    }
+
+  return ret;
+}
+
+static void add_address_to_nftsets(struct ipsets *entry, union all_addr *addr, int flags)
+{
+  char **set;
+
+  if (!entry)
+    return;
+
+  if (daemon->pipe_to_parent != -1)
+    cache_send_ipset(PIPE_OP_NFTSET, entry, flags, addr);
+  else
+    for (set = entry->sets; *set; set++)
+      if (add_to_nftset(*set, addr, flags, 0) == 0)
+	log_query((flags & (F_IPV4 | F_IPV6)) | F_IPSET,
+		  entry->domain, addr, *set, 0);
+}
+#endif
+
 int extract_addresses(struct dns_header *header, size_t qlen, char *name, time_t now, 
 		      struct ipsets *ipsets, struct ipsets *nftsets, int check_rebind,
 		      int no_cache_dnssec, int secure)
@@ -700,9 +754,7 @@ int extract_addresses(struct dns_header *header, size_t qlen, char *name, time_t
 #else
   (void)ipsets; /* unused */
 #endif
-#ifdef HAVE_NFTSET
-  char **nftsets_cur;
-#else
+#ifndef HAVE_NFTSET
   (void)nftsets; /* unused */
 #endif
   int name_encoding, found = 0, ptr = 0;
@@ -800,8 +852,13 @@ int extract_addresses(struct dns_header *header, size_t qlen, char *name, time_t
       else if (qtype != T_CNAME &&
 	       (qtype == T_SRV || qtype == T_PTR || rr_on_list(daemon->cache_rr, qtype) || rr_on_list(daemon->cache_rr, T_ANY)))
 	flags |= F_RR;
+
       else
 	insert = 0; /* NOTE: do not cache data from CNAME queries. */
+
+#ifdef HAVE_NFTSET
+      nftsets = nftsets_for_name(name, flags);
+#endif
       
     cname_loop:
       if (!(p1 = skip_questions(header, qlen)))
@@ -1018,15 +1075,13 @@ int extract_addresses(struct dns_header *header, size_t qlen, char *name, time_t
 			}
 #endif
 #ifdef HAVE_NFTSET
-		      if (nftsets)
-			{
-			  if (daemon->pipe_to_parent != -1)
-			    cache_send_ipset(PIPE_OP_NFTSET, nftsets, flags, &addr);
-			  else
-			    for (nftsets_cur = nftsets->sets; *nftsets_cur; nftsets_cur++)
-			      if (add_to_nftset(*nftsets_cur, &addr, flags, 0) == 0)
-				log_query((flags & (F_IPV4 | F_IPV6)) | F_IPSET, nftsets->domain, &addr, *nftsets_cur, 0);
-			}
+		      {
+			struct ipsets *answer_nftsets = nftsets_for_name(name, flags);
+
+			add_address_to_nftsets(nftsets, &addr, flags);
+			if (answer_nftsets != nftsets)
+			  add_address_to_nftsets(answer_nftsets, &addr, flags);
+		      }
 #endif
 		    }
 		}
@@ -1628,6 +1683,9 @@ size_t answer_request(struct dns_header *header, char *limit, size_t qlen,
   size_t len;
   int rd_bit = (header->hb3 & HB3_RD);
   int count = 255; /* catch loops */
+#ifdef HAVE_NFTSET
+  struct ipsets *query_nftsets = NULL;
+#endif
 
   /* Suppress cached answers if no_cache set. */
   if (no_cache)
@@ -1668,6 +1726,11 @@ size_t answer_request(struct dns_header *header, char *limit, size_t qlen,
   
   GETSHORT(qtype, p); 
   GETSHORT(qclass, p);
+
+#ifdef HAVE_NFTSET
+  if (qclass == C_IN && (qtype == T_A || qtype == T_AAAA))
+    query_nftsets = nftsets_for_name(name, qtype == T_A ? F_IPV4 : F_IPV6);
+#endif
   
   ans = 0; /* have we answered this question */
   
@@ -2080,6 +2143,16 @@ size_t answer_request(struct dns_header *header, char *limit, size_t qlen,
 			ans = 1;
 			log_query(stale_flag | (crecp->flags & ~F_REVERSE), name, &crecp->addr,
 				  record_source(crecp->uid), 0);
+
+#ifdef HAVE_NFTSET
+			{
+			  struct ipsets *answer_nftsets = nftsets_for_name(name, flag);
+
+			  add_address_to_nftsets(query_nftsets, &crecp->addr, flag);
+			  if (answer_nftsets != query_nftsets)
+			    add_address_to_nftsets(answer_nftsets, &crecp->addr, flag);
+			}
+#endif
 			
 			if (add_resource_record(header, limit, &trunc, nameoffset, &ansp, 
 						crec_ttl(crecp, now), NULL, type, C_IN, 
